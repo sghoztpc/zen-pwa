@@ -677,7 +677,8 @@ user_pref("browser.startup.homepage_override.mstone", "ignore");
 user_pref("datareporting.policy.firstRunURL", "");
 user_pref("browser.tabs.warnOnClose", false);
 user_pref("zen.view.use-single-toolbar", false);
-user_pref("zen.theme.hide-unified-extensions-button", false);
+// Use Zen's native compact Extensions grid inside #zen-site-data-icon-button so extension popups anchor properly
+user_pref("zen.theme.hide-unified-extensions-button", true);
 user_pref("zen.view.compact.enable-at-startup", true);
 user_pref("zen.view.compact.should-enable-at-startup", true);
 user_pref("zen.view.compact.hide-tabbar", true);
@@ -733,7 +734,7 @@ user_pref("extensions.startupScanScopes", 1);
   -moz-window-dragging: drag !important;
 }
 
-#nav-bar > :not(#nav-bar-customization-target):not(#unified-extensions-button):not(.titlebar-buttonbox-container) {
+#nav-bar > :not(#nav-bar-customization-target):not(.titlebar-buttonbox-container) {
   display: none !important;
 }
 
@@ -747,27 +748,108 @@ user_pref("extensions.startupScanScopes", 1);
   -moz-window-dragging: drag !important;
 }
 
-#nav-bar-customization-target > :not(#back-button):not(#forward-button):not(#stop-reload-button):not(#reload-button):not(#unified-extensions-button) {
+#nav-bar-customization-target > :not(#back-button):not(#forward-button):not(#stop-reload-button):not(#reload-button):not(#urlbar-container) {
   display: none !important;
 }
 
 #back-button,
 #forward-button,
 #stop-reload-button,
-#reload-button,
-#unified-extensions-button {
+#reload-button {
   -moz-window-dragging: no-drag !important;
   pointer-events: auto !important;
   --toolbarbutton-inner-padding: 5px !important;
   border-radius: 6px !important;
 }
 
-#unified-extensions-button {
+/* Collapse the URL bar down to only Zen's native #zen-site-data-icon-button (compact Extensions grid + popup anchor) */
+#urlbar-container {
+  display: flex !important;
+  align-items: center !important;
+  flex: 0 0 auto !important;
+  width: auto !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  min-height: 0 !important;
+  height: 32px !important;
+  padding: 0 !important;
+  margin: 0 6px 0 auto !important;
+  -moz-window-dragging: no-drag !important;
+}
+
+#urlbar,
+#urlbar[breakout],
+#urlbar[breakout-extend],
+#urlbar[open] {
+  position: static !important;
+  inset: auto !important;
+  transform: none !important;
+  display: flex !important;
+  align-items: center !important;
+  width: auto !important;
+  min-width: 0 !important;
+  min-height: 26px !important;
+  height: 26px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  --urlbar-box-bgcolor: transparent !important;
+  --urlbar-box-focus-bgcolor: transparent !important;
+  -moz-window-dragging: no-drag !important;
+}
+
+#urlbar .urlbar-background,
+#urlbar .urlbar-input-box,
+#urlbar .urlbarView,
+#urlbar #urlbar-input,
+#urlbar #urlbar-scheme,
+#urlbar #urlbar-search-mode-indicator,
+#urlbar #urlbar-label-box,
+#urlbar #urlbar-revert-button-container,
+#urlbar #page-action-buttons,
+#urlbar #tracking-protection-icon-container,
+#urlbar #trust-icon-container,
+#urlbar #remote-control-box,
+#urlbar #notification-popup-box,
+#urlbar .search-one-offs {
+  display: none !important;
+}
+
+#urlbar .urlbar-input-container {
+  display: flex !important;
+  align-items: center !important;
+  width: auto !important;
+  min-width: 0 !important;
+  height: 26px !important;
+  padding: 0 !important;
+  border: none !important;
+}
+
+#identity-box {
+  display: flex !important;
+  align-items: center !important;
+  margin: 0 !important;
+  padding: 0 !important;
+}
+
+#identity-box > :not(#zen-site-data-icon-button) {
+  display: none !important;
+}
+
+#zen-site-data-icon-button {
   display: flex !important;
   visibility: visible !important;
-  flex-shrink: 0 !important;
-  margin-inline-start: auto !important;
-  margin-inline-end: 6px !important;
+  align-items: center !important;
+  justify-content: center !important;
+  width: 26px !important;
+  height: 26px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border-radius: 6px !important;
+  -moz-window-dragging: no-drag !important;
+  pointer-events: auto !important;
 }
 
 .titlebar-buttonbox-container {
