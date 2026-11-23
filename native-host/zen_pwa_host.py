@@ -685,6 +685,22 @@ def _sync_idb_storage_dirs(
     return (copied, warn)
 
 
+def _invalidate_extension_caches(profile_dir: Path) -> None:
+    """Clear Firefox/Zen extension startup caches so updated UUIDs reload icons & popups cleanly."""
+    for name in ("startupCache", "addonStartup.json.lz4"):
+        raw = profile_dir / name
+        if _is_link_or_junction(raw):
+            continue
+        try:
+            target = safe_child(profile_dir, name)
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+            elif target.is_file():
+                target.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pass
+
+
 def sync_zen_extension_settings(
     src_profile: Path,
     profile_dir: Path,
@@ -709,6 +725,8 @@ def sync_zen_extension_settings(
     warnings: list[str] = []
     if not merge_webext_uuids_into_prefs(profile_dir, matched_uuids):
         warnings.append("Could not update extension UUIDs in app prefs.js.")
+    else:
+        _invalidate_extension_caches(profile_dir)
 
     copied_dirs, idb_warn = _sync_idb_storage_dirs(src_profile_res, profile_dir, list(matched_uuids.values()))
     if idb_warn:
