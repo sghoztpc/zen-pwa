@@ -31,7 +31,8 @@ from uuid import UUID
 
 from PIL import Image, ImageDraw, ImageFont
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
+SELF_EXTENSION_ID = "zen-pwa-ct2026@lazymoon.dev"
 MAX_MESSAGE_BYTES = 1_048_576
 MAX_ICON_BYTES = 5 * 1024 * 1024
 MAX_ICON_DIMENSION = 4096
@@ -313,6 +314,155 @@ def sync_domain_cookies(profile_dir: Path, start_url: str) -> tuple[int, str | N
         return (0, "Skipped login cookie sync due to an unexpected database error.")
 
 
+MAX_EXTENSIONS_JSON_BYTES = 5 * 1024 * 1024
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    is_junc = getattr(path, "is_junction", None)
+    return bool(is_junc()) if callable(is_junc) else False
+
+
+def _validate_xpi_candidate(candidate: Path, src_ext_dir: Path) -> Path | None:
+    try:
+        if _is_link_or_junction(candidate):
+            return None
+        resolved = candidate.resolve()
+        if (
+            resolved.is_file()
+            and resolved.suffix.lower() == ".xpi"
+            and resolved.is_relative_to(src_ext_dir)
+            and resolved.stem.lower() != SELF_EXTENSION_ID.lower()
+        ):
+            return resolved
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def collect_zen_extension_xpis(src_profile: Path) -> list[Path]:
+    """Discover active, non-symlinked .xpi files in the main Zen profile."""
+    src_profile_res = src_profile.resolve()
+    src_ext_raw = src_profile_res / "extensions"
+    if _is_link_or_junction(src_ext_raw):
+        return []
+    try:
+        src_ext_dir = src_ext_raw.resolve()
+    except OSError:
+        return []
+    if not src_ext_dir.is_dir() or not src_ext_dir.is_relative_to(src_profile_res):
+        return []
+
+    seen: set[str] = set()
+    candidates: list[Path] = []
+
+    def add_unique(path: Path | None) -> None:
+        if path is None:
+            return
+        key = str(path).lower()
+        if key not in seen:
+            seen.add(key)
+            candidates.append(path)
+
+    ext_json = src_profile_res / "extensions.json"
+    used_manifest = False
+    if ext_json.is_file() and not _is_link_or_junction(ext_json):
+        try:
+            if ext_json.stat().st_size <= MAX_EXTENSIONS_JSON_BYTES:
+                data = json.loads(ext_json.read_text(encoding="utf-8"))
+                addons = data.get("addons") if isinstance(data, dict) else None
+                if isinstance(addons, list):
+                    used_manifest = True
+                    for addon in addons:
+                        if not isinstance(addon, dict):
+                            continue
+                        if addon.get("type") != "extension" or addon.get("location") != "app-profile":
+                            continue
+                        if not addon.get("active") or addon.get("userDisabled"):
+                            continue
+                        addon_id = addon.get("id")
+                        if not isinstance(addon_id, str) or not addon_id or addon_id.lower() == SELF_EXTENSION_ID.lower():
+                            continue
+                        raw_path = addon.get("path")
+                        cand = Path(raw_path) if isinstance(raw_path, str) and raw_path else (src_ext_dir / f"{addon_id}.xpi")
+                        add_unique(_validate_xpi_candidate(cand, src_ext_dir))
+        except (OSError, UnicodeDecodeError, ValueError):
+            used_manifest = False
+            seen.clear()
+            candidates.clear()
+
+    if not used_manifest:
+        for item in src_ext_dir.glob("*.xpi"):
+            add_unique(_validate_xpi_candidate(item, src_ext_dir))
+
+    return candidates
+
+
+def sync_zen_extensions(
+    profile_dir: Path,
+    candidates: list[Path] | None = None,
+) -> tuple[int, str | None]:
+    """Copy active profile extensions (.xpi) from main Zen into the app profile."""
+    if candidates is None:
+        src_profile = find_default_zen_profile()
+        if not src_profile:
+            return (0, "Default Zen profile not found; skipped extension sync.")
+        candidates = collect_zen_extension_xpis(src_profile)
+
+    dst_ext_raw = profile_dir / "extensions"
+    if _is_link_or_junction(dst_ext_raw):
+        return (0, "Skipped extension sync because app extensions path is a link.")
+    try:
+        dst_ext_dir = safe_child(profile_dir, "extensions")
+        dst_ext_dir.mkdir(parents=True, exist_ok=True)
+    except (OSError, ValueError):
+        return (0, "Could not create app extensions directory.")
+
+    active_names = {p.name.lower() for p in candidates}
+    for existing in dst_ext_dir.glob("*.xpi"):
+        try:
+            if not _is_link_or_junction(existing) and existing.name.lower() not in active_names:
+                existing.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    synced = 0
+    failed = 0
+    for src_xpi in candidates:
+        tmp_path: Path | None = None
+        try:
+            if _is_link_or_junction(src_xpi):
+                continue
+            dst_xpi = safe_child(dst_ext_dir, src_xpi.name)
+            if _is_link_or_junction(dst_xpi):
+                failed += 1
+                continue
+            src_stat = src_xpi.stat()
+            if dst_xpi.is_file():
+                dst_stat = dst_xpi.stat()
+                if dst_stat.st_size == src_stat.st_size and int(dst_stat.st_mtime) == int(src_stat.st_mtime):
+                    synced += 1
+                    continue
+            fd, tmp_name = tempfile.mkstemp(dir=dst_ext_dir, prefix=".tmp-", suffix=".xpi")
+            os.close(fd)
+            tmp_path = Path(tmp_name)
+            shutil.copy2(src_xpi, tmp_path)
+            tmp_path.replace(dst_xpi)
+            tmp_path = None
+            synced += 1
+        except (OSError, ValueError):
+            failed += 1
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    warning = f"Could not copy {failed} extension(s) into app profile." if failed else None
+    return (synced, warning)
+
+
 def ensure_dirs() -> None:
     PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     ICONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -530,6 +680,9 @@ user_pref("zen.view.compact.enable-at-startup", true);
 user_pref("zen.view.compact.should-enable-at-startup", true);
 user_pref("zen.view.compact.hide-tabbar", true);
 user_pref("zen.view.compact.hide-toolbar", true);
+// Auto-enable extensions synced from main Zen profile (profile scope = 1 only)
+user_pref("extensions.autoDisableScopes", 14);
+user_pref("extensions.startupScanScopes", 1);
 """
     (profile_dir / "user.js").write_text(user_js, encoding="utf-8")
 
@@ -783,6 +936,7 @@ def handle_install(msg: dict[str, Any]) -> dict[str, Any]:
     )
 
     setup_zen_profile(profile_dir)
+    extensions_synced, extension_warning = sync_zen_extensions(profile_dir)
 
     cookies_synced = 0
     cookie_warning = None
@@ -836,6 +990,8 @@ def handle_install(msg: dict[str, Any]) -> dict[str, Any]:
         "app": record,
         "cookiesSynced": cookies_synced,
         "cookieWarning": cookie_warning,
+        "extensionsSynced": extensions_synced,
+        "extensionWarning": extension_warning,
     }
 
 
@@ -849,10 +1005,35 @@ def handle_launch(msg: dict[str, Any]) -> dict[str, Any]:
     zen_exe = find_zen_exe()
     profile_dir = safe_child(PROFILES_DIR, app_id)
     start_url = validate_http_url(app.get("startUrl", ""), "startUrl")
-    # Refresh standard window template on launch so existing apps stay up to date.
+    # Refresh standard window template and extensions on launch so existing apps stay up to date.
     setup_zen_profile(profile_dir)
+    extensions_synced, extension_warning = sync_zen_extensions(profile_dir)
     launch_zen_app(zen_exe, profile_dir, start_url)
-    return {"ok": True, "id": app_id}
+    return {
+        "ok": True,
+        "id": app_id,
+        "extensionsSynced": extensions_synced,
+        "extensionWarning": extension_warning,
+    }
+
+
+def handle_sync_all() -> dict[str, Any]:
+    """Refresh profile template and synced extensions across all installed apps."""
+    apps = load_apps()
+    src_profile = find_default_zen_profile()
+    candidates = collect_zen_extension_xpis(src_profile) if src_profile else None
+    results = []
+    for app in apps:
+        raw_id = app.get("id") if isinstance(app, dict) else None
+        try:
+            app_id = validate_app_id(raw_id)
+            profile_dir = safe_child(PROFILES_DIR, app_id)
+            setup_zen_profile(profile_dir)
+            ext_count, ext_warn = sync_zen_extensions(profile_dir, candidates=candidates)
+            results.append({"id": app_id, "extensionsSynced": ext_count, "warning": ext_warn})
+        except (OSError, ValueError, AttributeError) as exc:
+            results.append({"id": raw_id, "extensionsSynced": 0, "warning": str(exc)})
+    return {"ok": True, "syncedApps": results}
 
 
 def handle_uninstall(msg: dict[str, Any]) -> dict[str, Any]:
@@ -898,6 +1079,8 @@ def dispatch(msg: dict[str, Any]) -> dict[str, Any]:
         return handle_launch(msg)
     if action == "uninstall":
         return handle_uninstall(msg)
+    if action == "sync_all":
+        return handle_sync_all()
     return {"ok": False, "error": f"Unknown action: {action}"}
 
 

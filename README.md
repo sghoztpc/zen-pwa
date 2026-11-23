@@ -7,6 +7,7 @@ A WebExtension plus a small local Python helper (Native Messaging host).
 - Works on any website: reads the site's Web App Manifest (`name`, `start_url`, `icons`, `theme_color`), or falls back to page metadata.
 - Creates an isolated Zen profile per app (`%LOCALAPPDATA%\ZenPWA\profiles\<app-id>`) with a `userChrome.css` that hides the browser UI, so the site looks like a normal app window (with close / minimize / maximize).
 - Copies the login cookies for that site (and its sign-in domains, e.g. Google for YouTube Music) from your main Zen profile, so you stay signed in.
+- Syncs your active Zen extensions (e.g. uBlock Origin, Dark Reader) from your main Zen profile into each app profile, and prunes extensions you disable or remove.
 - Converts the site icon to a Windows `.ico` and creates Start Menu (`Zen Apps`) and Desktop shortcuts.
 - Builds a tiny launcher `.exe` per app (and one for Zen itself, `Zen Browser` in the Start Menu) so launchers like Raycast treat each app as a separate program.
 
@@ -22,8 +23,12 @@ A WebExtension plus a small local Python helper (Native Messaging host).
    ```
 2. Install the extension in Zen:
    - **Quick test:** open `about:debugging#/runtime/this-firefox`, click **Load Temporary Add-on...**, pick `extension/manifest.json`. It is removed when Zen restarts.
-   - **Permanent:** get it signed (see below) and open the signed `.xpi` in Zen.
+   - **Permanent:** download the signed `.xpi` from [Releases](https://github.com/sghoztpc/zen-pwa/releases) and open it in Zen, or sign it yourself (see below).
 3. On any website, click the Zen PWA toolbar button and choose **Install as App**.
+4. To re-sync extensions into already-installed apps after adding/removing extensions in main Zen:
+   ```powershell
+   python .\native-host\zen_pwa_host.py --cli '{\"action\":\"sync_all\"}'
+   ```
 
 ## Updating the extension
 Zen only keeps signed extensions permanently.
@@ -40,6 +45,7 @@ Zen only keeps signed extensions permanently.
 - The helper only accepts messages from this extension's ID.
 - URLs are validated (http/https only, no backslashes); app IDs are restricted to `[a-z0-9-]`.
 - Launchers are compiled with `csc.exe /noconfig` inside a private temp folder and moved into place atomically.
+- App profiles set `extensions.autoDisableScopes = 14` and `extensions.startupScanScopes = 1` so extensions copied into `<profile>/extensions/` auto-enable on startup (profile scope only; system/user scopes stay disabled). Symlinks and NTFS junctions are rejected during sync.
 
 ## Layout
 ```
