@@ -679,8 +679,8 @@ user_pref("browser.tabs.warnOnClose", false);
 user_pref("zen.view.use-single-toolbar", false);
 // Use Zen's native compact Extensions grid inside #zen-site-data-icon-button so extension popups anchor properly
 user_pref("zen.theme.hide-unified-extensions-button", true);
-user_pref("zen.view.compact.enable-at-startup", true);
-user_pref("zen.view.compact.should-enable-at-startup", true);
+user_pref("zen.view.compact.enable-at-startup", false);
+user_pref("zen.view.compact.should-enable-at-startup", false);
 user_pref("zen.view.compact.hide-tabbar", true);
 user_pref("zen.view.compact.hide-toolbar", false);
 // Auto-enable extensions synced from main Zen profile (profile scope = 1 only)
@@ -766,10 +766,11 @@ user_pref("extensions.startupScanScopes", 1);
 #urlbar-container {
   display: flex !important;
   align-items: center !important;
-  flex: 0 0 auto !important;
-  width: auto !important;
-  min-width: 0 !important;
-  max-width: none !important;
+  justify-content: center !important;
+  flex: 0 0 28px !important;
+  width: 28px !important;
+  min-width: 28px !important;
+  max-width: 28px !important;
   min-height: 0 !important;
   height: 32px !important;
   padding: 0 !important;
@@ -786,12 +787,15 @@ user_pref("extensions.startupScanScopes", 1);
   transform: none !important;
   display: flex !important;
   align-items: center !important;
-  width: auto !important;
-  min-width: 0 !important;
+  justify-content: center !important;
+  width: 28px !important;
+  min-width: 28px !important;
+  max-width: 28px !important;
   min-height: 26px !important;
   height: 26px !important;
   margin: 0 !important;
   padding: 0 !important;
+  overflow: hidden !important;
   background: transparent !important;
   border: none !important;
   box-shadow: none !important;
@@ -803,6 +807,7 @@ user_pref("extensions.startupScanScopes", 1);
 #urlbar .urlbar-background,
 #urlbar .urlbar-input-box,
 #urlbar .urlbarView,
+#urlbar .urlbar-input-container > :not(#identity-box),
 #urlbar #urlbar-input,
 #urlbar #urlbar-scheme,
 #urlbar #urlbar-search-mode-indicator,
@@ -813,23 +818,17 @@ user_pref("extensions.startupScanScopes", 1);
 #urlbar #trust-icon-container,
 #urlbar #remote-control-box,
 #urlbar #notification-popup-box,
+#urlbar #zen-copy-url-button,
 #urlbar .search-one-offs {
   display: none !important;
-}
-
-#urlbar .urlbar-input-container {
-  display: flex !important;
-  align-items: center !important;
-  width: auto !important;
-  min-width: 0 !important;
-  height: 26px !important;
-  padding: 0 !important;
-  border: none !important;
 }
 
 #identity-box {
   display: flex !important;
   align-items: center !important;
+  justify-content: center !important;
+  width: 26px !important;
+  height: 26px !important;
   margin: 0 !important;
   padding: 0 !important;
 }
@@ -850,6 +849,17 @@ user_pref("extensions.startupScanScopes", 1);
   border-radius: 6px !important;
   -moz-window-dragging: no-drag !important;
   pointer-events: auto !important;
+  cursor: pointer !important;
+}
+
+#zen-site-data-icon-button:hover {
+  background-color: color-mix(in srgb, currentColor 12%, transparent) !important;
+}
+
+#zen-site-data-icon-button image {
+  width: 16px !important;
+  height: 16px !important;
+  fill: currentColor !important;
 }
 
 .titlebar-buttonbox-container {
