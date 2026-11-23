@@ -676,21 +676,21 @@ user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("browser.startup.homepage_override.mstone", "ignore");
 user_pref("datareporting.policy.firstRunURL", "");
 user_pref("browser.tabs.warnOnClose", false);
+user_pref("zen.view.use-single-toolbar", false);
 user_pref("zen.view.compact.enable-at-startup", true);
 user_pref("zen.view.compact.should-enable-at-startup", true);
 user_pref("zen.view.compact.hide-tabbar", true);
-user_pref("zen.view.compact.hide-toolbar", true);
+user_pref("zen.view.compact.hide-toolbar", false);
 // Auto-enable extensions synced from main Zen profile (profile scope = 1 only)
 user_pref("extensions.autoDisableScopes", 14);
 user_pref("extensions.startupScanScopes", 1);
 """
     (profile_dir / "user.js").write_text(user_js, encoding="utf-8")
 
-    user_chrome = """/* Zen PWA standalone app window: hide browser chrome while keeping native OS titlebar */
+    user_chrome = """/* Zen PWA standalone app window: hide browser sidebar/URL bar, keep native OS titlebar + slim Extensions bar */
 #navigator-toolbox,
 #zen-sidebar-splitter,
 #PersonalToolbar,
-#zen-appcontent-navbar-wrapper,
 #zen-sidebar-top-buttons,
 #zen-sidebar-foot-buttons {
   display: none !important;
@@ -699,6 +699,55 @@ user_pref("extensions.startupScanScopes", 1);
   min-width: 0 !important;
   height: 0 !important;
   min-height: 0 !important;
+}
+
+/* Slim top app bar holding only Back / Forward / Reload and the Extensions button */
+#zen-appcontent-navbar-wrapper {
+  display: flex !important;
+  visibility: visible !important;
+  min-height: 30px !important;
+  max-height: 32px !important;
+  padding: 0 6px !important;
+  margin: 0 !important;
+}
+
+/* Hide the slim app bar completely in video/DOM fullscreen and F11 fullscreen */
+:root[inDOMFullscreen="true"] #zen-appcontent-navbar-wrapper,
+:root[inFullscreen="true"] #zen-appcontent-navbar-wrapper {
+  display: none !important;
+}
+
+#nav-bar {
+  display: flex !important;
+  align-items: center !important;
+  width: 100% !important;
+  min-height: 30px !important;
+  max-height: 32px !important;
+  padding: 0 !important;
+  margin: 0 !important;
+}
+
+#nav-bar > :not(#nav-bar-customization-target):not(#unified-extensions-button) {
+  display: none !important;
+}
+
+#nav-bar-customization-target {
+  display: flex !important;
+  align-items: center !important;
+  flex: 1 1 auto !important;
+  min-width: 0 !important;
+  gap: 2px !important;
+}
+
+#nav-bar-customization-target > :not(#back-button):not(#forward-button):not(#stop-reload-button):not(#reload-button):not(#unified-extensions-button) {
+  display: none !important;
+}
+
+#unified-extensions-button {
+  display: flex !important;
+  visibility: visible !important;
+  flex-shrink: 0 !important;
+  margin-inline-start: auto !important;
 }
 
 #zen-main-app-wrapper,
