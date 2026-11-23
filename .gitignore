@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+dist/
+web-ext-artifacts/
+# Generated per machine by register_host.ps1
+native-host/zen_pwa_host.bat
+native-host/zen_pwa_host.json

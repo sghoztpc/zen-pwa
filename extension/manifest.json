@@ -1,0 +1,46 @@
+{
+  "manifest_version": 2,
+  "name": "Zen PWA",
+  "version": "1.2.0",
+  "description": "Install websites as standalone Zen desktop apps (Chromium-style PWA support for Zen Browser).",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "zen-pwa-ct2026@lazymoon.dev",
+      "strict_min_version": "142.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    },
+    "gecko_android": {
+      "strict_min_version": "142.0"
+    }
+  },
+  "icons": {
+    "48": "icons/icon-48.png",
+    "96": "icons/icon-96.png"
+  },
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "storage",
+    "nativeMessaging"
+  ],
+  "browser_action": {
+    "default_icon": {
+      "48": "icons/icon-48.png",
+      "96": "icons/icon-96.png"
+    },
+    "default_title": "Zen PWA — Install as App",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

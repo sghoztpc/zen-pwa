@@ -1,0 +1,954 @@
+#!/usr/bin/env python3
+"""Zen PWA Native Messaging Host for Windows.
+
+Manages isolated Zen Browser standalone app profiles, .ico icons,
+domain-scoped login cookie sync, and Windows Start Menu / Desktop shortcuts.
+"""
+
+from __future__ import annotations
+
+import base64
+import configparser
+import ctypes
+import hashlib
+import io
+import ipaddress
+import json
+import os
+import re
+import shutil
+import socket
+import sqlite3
+import struct
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+from PIL import Image, ImageDraw, ImageFont
+
+VERSION = "1.2.1"
+MAX_MESSAGE_BYTES = 1_048_576
+MAX_ICON_BYTES = 5 * 1024 * 1024
+MAX_ICON_DIMENSION = 4096
+MAX_REDIRECTS = 3
+Image.MAX_IMAGE_PIXELS = 16_000_000
+
+APP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+# Ecosystem sibling domains used during SSO sign-in so apps like YouTube Music stay signed in.
+SSO_ECOSYSTEMS: list[set[str]] = [
+    {"youtube.com", "youtu.be", "google.com"},
+    {"microsoft.com", "live.com", "office.com", "outlook.com", "microsoftonline.com"},
+    {"apple.com", "icloud.com"},
+]
+
+# Multi-tenant hosting suffixes where each subdomain is an independent site.
+SHARED_HOSTING_SUFFIXES = {
+    "github.io", "gitlab.io", "pages.dev", "vercel.app", "netlify.app",
+    "herokuapp.com", "appspot.com", "web.app", "firebaseapp.com",
+    "blogspot.com", "wordpress.com", "azurewebsites.net", "cloudfront.net",
+    "amazonaws.com", "ondigitalocean.app", "fly.dev", "railway.app", "render.com",
+}
+
+STANDARD_GTLDS = {
+    "com", "org", "net", "io", "app", "dev", "ai", "tv", "me", "co", "gg",
+    "fm", "so", "sh", "xyz", "info", "biz", "edu", "gov", "music", "chat",
+}
+
+DATA_ROOT = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "ZenPWA"
+PROFILES_DIR = DATA_ROOT / "profiles"
+ICONS_DIR = DATA_ROOT / "icons"
+LAUNCHERS_DIR = DATA_ROOT / "launchers"
+APPS_DB_PATH = DATA_ROOT / "apps.json"
+
+CSC_EXE = (
+    Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    / "Microsoft.NET"
+    / "Framework64"
+    / "v4.0.30319"
+    / "csc.exe"
+)
+
+ZEN_APPDATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "zen"
+
+START_MENU_PROGRAMS_DIR = (
+    Path(os.environ.get("APPDATA", str(Path.home())))
+    / "Microsoft"
+    / "Windows"
+    / "Start Menu"
+    / "Programs"
+)
+START_MENU_DIR = START_MENU_PROGRAMS_DIR / "Zen Apps"
+
+POWERSHELL_EXE = (
+    Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    / "System32"
+    / "WindowsPowerShell"
+    / "v1.0"
+    / "powershell.exe"
+)
+
+
+def get_windows_desktop_dir() -> Path:
+    """Resolve the real Windows Desktop folder (handles OneDrive redirection)."""
+    try:
+        folder_id = UUID("{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}")
+        path_ptr = ctypes.c_wchar_p()
+        hr = ctypes.windll.shell32.SHGetKnownFolderPath(
+            ctypes.byref(ctypes.create_string_buffer(folder_id.bytes_le, 16)),
+            0,
+            None,
+            ctypes.byref(path_ptr),
+        )
+        if hr == 0 and path_ptr.value:
+            result = Path(path_ptr.value)
+            ctypes.windll.ole32.CoTaskMemFree(path_ptr)
+            return result
+    except Exception:
+        pass
+    return Path.home() / "Desktop"
+
+
+DESKTOP_DIR = get_windows_desktop_dir()
+
+
+def find_zen_exe() -> Path:
+    candidates = [
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Zen Browser" / "zen.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Zen Browser" / "zen.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Zen Browser" / "zen.exe",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise FileNotFoundError("Zen Browser executable (zen.exe) was not found.")
+
+
+def find_default_zen_profile() -> Path | None:
+    """Locate the user's active default Zen Browser profile from profiles.ini."""
+    ini_path = ZEN_APPDATA_DIR / "profiles.ini"
+    if not ini_path.is_file():
+        return None
+    parser = configparser.RawConfigParser()
+    try:
+        parser.read(ini_path, encoding="utf-8")
+    except (OSError, UnicodeDecodeError, configparser.Error):
+        return None
+
+    zen_root = ZEN_APPDATA_DIR.resolve()
+
+    def resolve_safe(raw_path: str, is_relative: bool) -> Path | None:
+        candidate = (zen_root / raw_path if is_relative else Path(raw_path)).resolve()
+        if is_relative and not candidate.is_relative_to(zen_root):
+            return None
+        if candidate.is_dir() and (candidate / "cookies.sqlite").is_file():
+            return candidate
+        return None
+
+    for section in parser.sections():
+        if section.startswith("Install") and parser.has_option(section, "Default"):
+            found = resolve_safe(parser.get(section, "Default").strip(), True)
+            if found:
+                return found
+
+    for section in parser.sections():
+        if section.startswith("Profile") and parser.get(section, "Default", fallback="0").strip() == "1":
+            raw_path = parser.get(section, "Path", fallback="").strip()
+            is_rel = parser.get(section, "IsRelative", fallback="1").strip() == "1"
+            found = resolve_safe(raw_path, is_rel)
+            if found:
+                return found
+    return None
+
+
+def get_base_domain(hostname: str) -> str:
+    host = hostname.lower().strip(".")
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+        return host
+    except ValueError:
+        pass
+
+    parts = host.split(".")
+    if len(parts) <= 2:
+        return host
+    last_two = ".".join(parts[-2:])
+    if last_two in SHARED_HOSTING_SUFFIXES:
+        return host
+    if parts[-1] in STANDARD_GTLDS:
+        return last_two
+    # For country-code TLDs or unrecognized suffixes, stay exact to avoid cross-site leakage.
+    return host
+
+
+def get_sync_domains(hostname: str) -> set[str]:
+    base = get_base_domain(hostname)
+    domains = {base}
+    for group in SSO_ECOSYSTEMS:
+        if base in group:
+            domains.update(group)
+    return domains
+
+
+def host_matches_domains(cookie_host: str, allowed_domains: set[str]) -> bool:
+    h = (cookie_host or "").lstrip(".").lower()
+    return any(h == d or h.endswith("." + d) for d in allowed_domains)
+
+
+def read_source_cookies(src_db: Path, allowed_domains: set[str]) -> tuple[str, list[str], int, list[str], list[tuple[Any, ...]]]:
+    conn = sqlite3.connect(f"{src_db.as_uri()}?mode=ro", uri=True, timeout=5.0)
+    try:
+        schema_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='moz_cookies'"
+        ).fetchone()
+        if not schema_row or not schema_row[0]:
+            raise ValueError("Could not read moz_cookies schema.")
+        create_sql = schema_row[0]
+        index_sqls = [
+            r[0]
+            for r in conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='moz_cookies' AND sql IS NOT NULL"
+            ).fetchall()
+        ]
+        user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(moz_cookies)").fetchall()]
+        col_list = ", ".join(f'"{c}"' for c in cols)
+        host_idx = cols.index("host")
+        where_clause = " WHERE originAttributes = ''" if "originAttributes" in cols else ""
+        rows = [
+            row
+            for row in conn.execute(f"SELECT {col_list} FROM moz_cookies{where_clause}").fetchall()
+            if host_matches_domains(str(row[host_idx] or ""), allowed_domains)
+        ]
+        return (create_sql, index_sqls, user_version, cols, rows)
+    finally:
+        conn.close()
+
+
+def write_dest_cookies(
+    dst_db: Path,
+    allowed_domains: set[str],
+    create_sql: str,
+    index_sqls: list[str],
+    user_version: int,
+    cols: list[str],
+    rows: list[tuple[Any, ...]],
+) -> int:
+    conn = sqlite3.connect(str(dst_db), timeout=5.0)
+    try:
+        conn.execute(f"PRAGMA user_version = {user_version}")
+        conn.execute(create_sql.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1))
+        for idx_sql in index_sqls:
+            safe_idx = idx_sql.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ", 1).replace(
+                "CREATE UNIQUE INDEX ", "CREATE UNIQUE INDEX IF NOT EXISTS ", 1
+            )
+            conn.execute(safe_idx)
+
+        existing_hosts = [r[0] for r in conn.execute("SELECT DISTINCT host FROM moz_cookies").fetchall()]
+        for h in existing_hosts:
+            if host_matches_domains(str(h or ""), allowed_domains):
+                conn.execute("DELETE FROM moz_cookies WHERE host = ?", (h,))
+
+        insert_cols = [c for c in cols if c != "id"]
+        insert_indices = [cols.index(c) for c in insert_cols]
+        placeholders = ", ".join("?" for _ in insert_cols)
+        insert_col_sql = ", ".join(f'"{c}"' for c in insert_cols)
+        filtered_rows = [tuple(r[i] for i in insert_indices) for r in rows]
+        conn.executemany(
+            f"INSERT OR REPLACE INTO moz_cookies ({insert_col_sql}) VALUES ({placeholders})",
+            filtered_rows,
+        )
+        conn.commit()
+        return len(filtered_rows)
+    finally:
+        conn.close()
+
+
+def sync_domain_cookies(profile_dir: Path, start_url: str) -> tuple[int, str | None]:
+    """Copy default-container, domain-scoped cookies from main Zen into the app profile."""
+    src_profile = find_default_zen_profile()
+    if not src_profile:
+        return (0, "Default Zen profile not found; skipped login sync.")
+
+    src_db = src_profile / "cookies.sqlite"
+    hostname = urllib.parse.urlparse(start_url).hostname or ""
+    if not src_db.is_file() or not hostname:
+        return (0, None)
+
+    allowed_domains = get_sync_domains(hostname)
+    try:
+        create_sql, index_sqls, user_version, cols, rows = read_source_cookies(src_db, allowed_domains)
+    except Exception:
+        return (0, "Could not read cookies from main Zen profile; skipped login sync.")
+
+    if not rows:
+        return (0, None)
+
+    try:
+        synced = write_dest_cookies(
+            profile_dir / "cookies.sqlite",
+            allowed_domains,
+            create_sql,
+            index_sqls,
+            user_version,
+            cols,
+            rows,
+        )
+        return (synced, None)
+    except sqlite3.OperationalError as exc:
+        if "locked" in str(exc).lower():
+            return (0, "App is currently open so login cookies could not be updated; close the app and reinstall to sync.")
+        return (0, "Could not write cookies into app profile; skipped login sync.")
+    except Exception:
+        return (0, "Skipped login cookie sync due to an unexpected database error.")
+
+
+def ensure_dirs() -> None:
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    ICONS_DIR.mkdir(parents=True, exist_ok=True)
+    LAUNCHERS_DIR.mkdir(parents=True, exist_ok=True)
+    START_MENU_DIR.mkdir(parents=True, exist_ok=True)
+    DESKTOP_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def validate_http_url(raw: str, label: str) -> str:
+    if not isinstance(raw, str):
+        raise ValueError(f"Invalid {label}: must be a string.")
+    url = raw.strip()
+    if not url or len(url) > 2048:
+        raise ValueError(f"Invalid {label}: empty or too long.")
+    if any(ch in url for ch in ('"', "\\", "\r", "\n", "\x00", "\t")):
+        raise ValueError(f"Invalid {label}: contains forbidden characters.")
+    if url.startswith("-"):
+        raise ValueError(f"Invalid {label}: cannot start with '-'.")
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(f"Invalid {label}: only http/https URLs are allowed.")
+    return url
+
+
+def assert_public_url(url: str) -> None:
+    """Block SSRF to loopback, private LAN, link-local, and metadata IPs."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("Only public http/https URLs are allowed.")
+    infos = socket.getaddrinfo(
+        parsed.hostname,
+        parsed.port or (443 if parsed.scheme == "https" else 80),
+        type=socket.SOCK_STREAM,
+    )
+    if not infos:
+        raise ValueError("Unable to resolve icon host.")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ValueError(f"Blocked non-public icon address: {ip}")
+
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self) -> None:
+        super().__init__()
+        self._redirects = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self._redirects += 1
+        if self._redirects > MAX_REDIRECTS:
+            raise ValueError("Too many redirects while fetching icon.")
+        target = urllib.parse.urljoin(req.full_url, newurl)
+        validate_http_url(target, "icon redirect")
+        assert_public_url(target)
+        return super().redirect_request(req, fp, code, msg, headers, target)
+
+
+def sanitize_app_name(raw: str, fallback: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", str(raw or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")[:60]
+    if not cleaned or cleaned.split(".")[0].upper() in WINDOWS_RESERVED_NAMES:
+        cleaned = re.sub(r"[^A-Za-z0-9 ._-]", "", fallback).strip(" .")[:60] or "Zen App"
+    if cleaned.split(".")[0].upper() in WINDOWS_RESERVED_NAMES:
+        cleaned = f"{cleaned} App"
+    return cleaned
+
+
+def make_app_id(name: str, origin: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:32] or "app"
+    digest = hashlib.sha256(origin.lower().encode("utf-8")).hexdigest()[:8]
+    app_id = f"{slug}-{digest}"
+    if not APP_ID_RE.match(app_id):
+        app_id = f"app-{digest}"
+    return app_id
+
+
+def validate_app_id(app_id: Any) -> str:
+    if not isinstance(app_id, str) or not APP_ID_RE.match(app_id):
+        raise ValueError("Invalid app id.")
+    return app_id
+
+
+def safe_child(parent: Path, child_name: str) -> Path:
+    parent_res = parent.resolve()
+    target = (parent_res / child_name).resolve()
+    if not target.is_relative_to(parent_res) or target == parent_res:
+        raise ValueError("Resolved path escaped target directory.")
+    return target
+
+
+def choose_shortcut_path(
+    parent_dir: Path,
+    base_name: str,
+    app_id: str,
+    existing_apps: list[dict[str, Any]],
+    shortcut_key: str,
+) -> Path:
+    """Avoid overwriting shortcuts owned by another app or untracked user shortcuts."""
+    own_existing = next((a.get(shortcut_key) for a in existing_apps if a.get("id") == app_id), None)
+    owned_by_others = {
+        str(Path(a[shortcut_key]).resolve()).lower()
+        for a in existing_apps
+        if a.get("id") != app_id and a.get(shortcut_key)
+    }
+
+    candidate = safe_child(parent_dir, f"{base_name}.lnk")
+    cand_key = str(candidate).lower()
+    if own_existing and str(Path(own_existing).resolve()).lower() == cand_key:
+        return candidate
+    if cand_key not in owned_by_others and not candidate.exists():
+        return candidate
+
+    suffix = app_id.rsplit("-", 1)[-1][:8]
+    return safe_child(parent_dir, f"{base_name} ({suffix}).lnk")
+
+
+def load_apps() -> list[dict[str, Any]]:
+    if not APPS_DB_PATH.is_file():
+        return []
+    raw = APPS_DB_PATH.read_text(encoding="utf-8")
+    data = json.loads(raw)
+    if not isinstance(data, list):
+        raise ValueError("apps.json is corrupted (expected a JSON list).")
+    return data
+
+
+def save_apps(apps: list[dict[str, Any]]) -> None:
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    tmp = APPS_DB_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(apps, indent=2), encoding="utf-8")
+    tmp.replace(APPS_DB_PATH)
+
+
+def parse_hex_color(raw: str) -> tuple[int, int, int]:
+    m = re.match(r"^#?([0-9a-fA-F]{6})$", str(raw or "").strip())
+    if not m:
+        return (37, 99, 235)
+    h = m.group(1)
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+
+def create_fallback_icon(name: str, theme_color: str, dest_ico: Path) -> None:
+    rgb = parse_hex_color(theme_color)
+    img = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle([(8, 8), (248, 248)], radius=52, fill=(*rgb, 255))
+    letter = (name.strip()[:1] or "Z").upper()
+    try:
+        font = ImageFont.truetype("segoeui.ttf", 140)
+    except Exception:
+        font = ImageFont.load_default()
+    bbox = draw.textbbox((0, 0), letter, font=font)
+    w = bbox[2] - bbox[0]
+    h = bbox[3] - bbox[1]
+    draw.text(((256 - w) / 2 - bbox[0], (256 - h) / 2 - bbox[1]), letter, fill=(255, 255, 255, 255), font=font)
+    img.save(dest_ico, format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+
+
+def download_and_build_icon(icon_url: str | None, name: str, theme_color: str, dest_ico: Path) -> None:
+    if icon_url:
+        try:
+            valid_icon = validate_http_url(icon_url, "iconUrl")
+            assert_public_url(valid_icon)
+            opener = urllib.request.build_opener(SafeRedirectHandler())
+            req = urllib.request.Request(
+                valid_icon,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZenPWA/1.1"},
+            )
+            with opener.open(req, timeout=10) as resp:
+                raw = resp.read(MAX_ICON_BYTES + 1)
+            if len(raw) <= MAX_ICON_BYTES:
+                img = Image.open(io.BytesIO(raw))
+                if img.width <= MAX_ICON_DIMENSION and img.height <= MAX_ICON_DIMENSION:
+                    img = img.convert("RGBA")
+                    img.thumbnail((256, 256), Image.Resampling.LANCZOS)
+                    square = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
+                    square.paste(img, ((256 - img.width) // 2, (256 - img.height) // 2))
+                    square.save(
+                        dest_ico,
+                        format="ICO",
+                        sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
+                    )
+                    return
+        except Exception:
+            pass
+    create_fallback_icon(name, theme_color, dest_ico)
+
+
+def setup_zen_profile(profile_dir: Path) -> None:
+    """Standard Zen PWA app profile template applied to every installed app."""
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    chrome_dir = profile_dir / "chrome"
+    chrome_dir.mkdir(parents=True, exist_ok=True)
+
+    user_js = """// Generated by Zen PWA for standalone app mode
+// Use native OS titlebar so every app has standard Minimize / Maximize / Close buttons
+user_pref("browser.tabs.inTitlebar", 0);
+// Give each Zen PWA profile its own Windows Taskbar button separate from main Zen Browser
+user_pref("taskbar.grouping.useprofile", true);
+user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);
+user_pref("zen.welcome-screen.seen", true);
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("datareporting.policy.firstRunURL", "");
+user_pref("browser.tabs.warnOnClose", false);
+user_pref("zen.view.compact.enable-at-startup", true);
+user_pref("zen.view.compact.should-enable-at-startup", true);
+user_pref("zen.view.compact.hide-tabbar", true);
+user_pref("zen.view.compact.hide-toolbar", true);
+"""
+    (profile_dir / "user.js").write_text(user_js, encoding="utf-8")
+
+    user_chrome = """/* Zen PWA standalone app window: hide browser chrome while keeping native OS titlebar */
+#navigator-toolbox,
+#zen-sidebar-splitter,
+#PersonalToolbar,
+#zen-appcontent-navbar-wrapper,
+#zen-sidebar-top-buttons,
+#zen-sidebar-foot-buttons {
+  display: none !important;
+  visibility: collapse !important;
+  width: 0 !important;
+  min-width: 0 !important;
+  height: 0 !important;
+  min-height: 0 !important;
+}
+
+#zen-main-app-wrapper,
+#zen-tabbox-wrapper,
+#tabbrowser-tabbox {
+  margin: 0 !important;
+  padding: 0 !important;
+  border-radius: 0 !important;
+}
+"""
+    (chrome_dir / "userChrome.css").write_text(user_chrome, encoding="utf-8")
+
+
+def compile_cs_launcher(cs_code: str, out_path: Path, icon_path: Path | None) -> Path | None:
+    if not CSC_EXE.is_file():
+        return None
+    try:
+        with tempfile.TemporaryDirectory(dir=LAUNCHERS_DIR) as tmp_dir:
+            tmp_root = Path(tmp_dir)
+            cs_path = tmp_root / "launcher.cs"
+            out_exe = tmp_root / "launcher.exe"
+            cs_path.write_text(cs_code, encoding="utf-8")
+            cmd = [
+                str(CSC_EXE),
+                "/nologo",
+                "/noconfig",
+                "/optimize+",
+                "/target:winexe",
+                "/r:System.dll",
+                "/r:System.Management.dll",
+                f"/out:{out_exe}",
+            ]
+            if icon_path is not None and icon_path.is_file():
+                cmd.append(f"/win32icon:{icon_path}")
+            cmd.append(str(cs_path))
+            subprocess.run(
+                cmd,
+                cwd=str(LAUNCHERS_DIR),
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=20,
+            )
+            out_exe.replace(out_path)
+            return out_path
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def make_smart_launcher_cs(
+    zen_exe: Path,
+    launch_args: str,
+    match_substring: str,
+    invert_match: bool,
+) -> str:
+    b64_zen = base64.b64encode(str(zen_exe).encode("utf-8")).decode("ascii")
+    b64_args = base64.b64encode(launch_args.encode("utf-8")).decode("ascii")
+    b64_match = base64.b64encode(match_substring.lower().encode("utf-8")).decode("ascii")
+    inv_lit = "true" if invert_match else "false"
+
+    return f"""using System;
+using System.Diagnostics;
+using System.Management;
+using System.Runtime.InteropServices;
+using System.Text;
+
+class ZenPwaLauncher {{
+    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hWnd);
+    const int SW_RESTORE = 9;
+
+    static string Dec(string b64) {{
+        return Encoding.UTF8.GetString(Convert.FromBase64String(b64));
+    }}
+
+    static bool FocusExisting(string needle, bool invert) {{
+        try {{
+            using (var searcher = new ManagementObjectSearcher(
+                "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name = 'zen.exe'")) {{
+                foreach (ManagementObject obj in searcher.Get()) {{
+                    string cmd = (obj["CommandLine"] as string ?? "").ToLowerInvariant();
+                    if (cmd.Contains("-contentproc")) continue;
+                    bool matches = cmd.Contains(needle);
+                    if (invert ? !matches : matches) {{
+                        int pid = Convert.ToInt32(obj["ProcessId"]);
+                        try {{
+                            var proc = Process.GetProcessById(pid);
+                            if (proc.MainWindowHandle != IntPtr.Zero) {{
+                                if (IsIconic(proc.MainWindowHandle)) ShowWindow(proc.MainWindowHandle, SW_RESTORE);
+                                SetForegroundWindow(proc.MainWindowHandle);
+                                return true;
+                            }}
+                        }} catch {{}}
+                    }}
+                }}
+            }}
+        }} catch {{}}
+        return false;
+    }}
+
+    static void Main() {{
+        string zen = Dec("{b64_zen}");
+        string args = Dec("{b64_args}");
+        string needle = Dec("{b64_match}");
+        if (FocusExisting(needle, {inv_lit})) return;
+        var psi = new ProcessStartInfo();
+        psi.FileName = zen;
+        psi.Arguments = args;
+        psi.UseShellExecute = false;
+        Process.Start(psi);
+    }}
+}}
+"""
+
+
+def build_launcher_exe(
+    launcher_exe: Path,
+    zen_exe: Path,
+    profile_dir: Path,
+    start_url: str,
+    icon_path: Path,
+) -> Path | None:
+    """Compile a tiny per-app GUI .exe so Raycast treats each Zen app separately from zen.exe."""
+    args = f'-new-instance -no-remote -profile "{profile_dir}" --new-window "{start_url}"'
+    cs_code = make_smart_launcher_cs(zen_exe, args, str(profile_dir), invert_match=False)
+    return compile_cs_launcher(cs_code, launcher_exe, icon_path)
+
+
+def ensure_main_zen_launcher(zen_exe: Path) -> None:
+    """Create a dedicated Zen Browser (Main) launcher so Raycast can open Zen even when a Zen App is already open."""
+    main_exe = safe_child(LAUNCHERS_DIR, "zen-browser-main.exe")
+    cs_code = make_smart_launcher_cs(zen_exe, "", str(PROFILES_DIR), invert_match=True)
+    compiled = compile_cs_launcher(cs_code, main_exe, None)
+    if compiled is None:
+        return
+    lnk_path = safe_child(START_MENU_PROGRAMS_DIR, "Zen Browser.lnk")
+    create_windows_shortcut(lnk_path, compiled, "", zen_exe, "Zen Browser (Main — Raycast safe)")
+
+
+def create_windows_shortcut(
+    lnk_path: Path,
+    target_exe: Path,
+    arguments: str,
+    icon_path: Path,
+    description: str,
+) -> None:
+    env = os.environ.copy()
+    env["ZENPWA_LNK_PATH"] = str(lnk_path)
+    env["ZENPWA_TARGET"] = str(target_exe)
+    env["ZENPWA_ARGS"] = arguments
+    env["ZENPWA_ICON"] = f"{icon_path},0"
+    env["ZENPWA_WORKDIR"] = str(target_exe.parent)
+    env["ZENPWA_DESC"] = description
+
+    ps_script = (
+        "$ws = New-Object -ComObject WScript.Shell; "
+        "$sc = $ws.CreateShortcut($env:ZENPWA_LNK_PATH); "
+        "$sc.TargetPath = $env:ZENPWA_TARGET; "
+        "$sc.Arguments = $env:ZENPWA_ARGS; "
+        "$sc.IconLocation = $env:ZENPWA_ICON; "
+        "$sc.WorkingDirectory = $env:ZENPWA_WORKDIR; "
+        "$sc.Description = $env:ZENPWA_DESC; "
+        "$sc.Save()"
+    )
+    subprocess.run(
+        [str(POWERSHELL_EXE), "-NoProfile", "-NonInteractive", "-Command", ps_script],
+        env=env,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        timeout=15,
+    )
+
+
+def launch_zen_app(zen_exe: Path, profile_dir: Path, start_url: str) -> None:
+    cmd = [
+        str(zen_exe),
+        "-new-instance",
+        "-no-remote",
+        "-profile",
+        str(profile_dir),
+        "--new-window",
+        start_url,
+    ]
+    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
+        subprocess, "DETACHED_PROCESS", 0
+    )
+    subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+        close_fds=True,
+    )
+
+
+def remove_shortcut_if_inside(raw_path: str | None, parent_dir: Path) -> None:
+    if not raw_path:
+        return
+    p = Path(raw_path).resolve()
+    if p.is_relative_to(parent_dir.resolve()) and p.suffix.lower() == ".lnk" and p.exists():
+        p.unlink()
+
+
+def handle_install(msg: dict[str, Any]) -> dict[str, Any]:
+    ensure_dirs()
+    zen_exe = find_zen_exe()
+
+    start_url = validate_http_url(msg.get("startUrl", ""), "startUrl")
+    parsed_start = urllib.parse.urlparse(start_url)
+    origin_raw = msg.get("origin") or start_url
+    parsed_origin = urllib.parse.urlparse(validate_http_url(origin_raw, "origin"))
+    if (parsed_start.scheme, parsed_start.netloc.lower()) != (
+        parsed_origin.scheme,
+        parsed_origin.netloc.lower(),
+    ):
+        raise ValueError("startUrl must have the same origin as the installed site.")
+    origin = f"{parsed_origin.scheme}://{parsed_origin.netloc}"
+
+    existing_apps = load_apps()
+    name = sanitize_app_name(msg.get("name", ""), parsed_origin.hostname or "Zen App")
+    app_id = make_app_id(name, origin)
+    prev_record = next((a for a in existing_apps if a.get("id") == app_id), None)
+
+    profile_dir = safe_child(PROFILES_DIR, app_id)
+    icon_path = safe_child(ICONS_DIR, f"{app_id}.ico")
+    start_menu_lnk = choose_shortcut_path(START_MENU_DIR, name, app_id, existing_apps, "startMenuShortcut")
+    want_desktop = bool(msg.get("createDesktopShortcut"))
+    desktop_lnk = (
+        choose_shortcut_path(DESKTOP_DIR, name, app_id, existing_apps, "desktopShortcut")
+        if want_desktop
+        else None
+    )
+
+    setup_zen_profile(profile_dir)
+
+    cookies_synced = 0
+    cookie_warning = None
+    if msg.get("syncSession", True):
+        cookies_synced, cookie_warning = sync_domain_cookies(profile_dir, start_url)
+
+    download_and_build_icon(msg.get("iconUrl"), name, msg.get("themeColor", ""), icon_path)
+    ensure_main_zen_launcher(zen_exe)
+
+    launcher_exe = safe_child(LAUNCHERS_DIR, f"{app_id}.exe")
+    compiled_launcher = build_launcher_exe(launcher_exe, zen_exe, profile_dir, start_url, icon_path)
+
+    if compiled_launcher is not None:
+        shortcut_target = compiled_launcher
+        shortcut_args = ""
+    else:
+        try:
+            launcher_exe.unlink(missing_ok=True)
+        except OSError:
+            pass
+        shortcut_target = zen_exe
+        shortcut_args = f'-new-instance -no-remote -profile "{profile_dir}" --new-window "{start_url}"'
+
+    create_windows_shortcut(start_menu_lnk, shortcut_target, shortcut_args, icon_path, f"{name} (Zen PWA)")
+    if desktop_lnk is not None:
+        create_windows_shortcut(desktop_lnk, shortcut_target, shortcut_args, icon_path, f"{name} (Zen PWA)")
+    elif prev_record and prev_record.get("desktopShortcut"):
+        remove_shortcut_if_inside(prev_record.get("desktopShortcut"), DESKTOP_DIR)
+
+    record = {
+        "id": app_id,
+        "name": name,
+        "startUrl": start_url,
+        "origin": origin,
+        "profileDir": str(profile_dir),
+        "iconPath": str(icon_path),
+        "launcherExe": str(compiled_launcher) if compiled_launcher else None,
+        "startMenuShortcut": str(start_menu_lnk),
+        "desktopShortcut": str(desktop_lnk) if desktop_lnk else None,
+    }
+
+    apps = [a for a in existing_apps if a.get("id") != app_id]
+    apps.append(record)
+    save_apps(apps)
+
+    if msg.get("launchAfterInstall"):
+        launch_zen_app(zen_exe, profile_dir, start_url)
+
+    return {
+        "ok": True,
+        "app": record,
+        "cookiesSynced": cookies_synced,
+        "cookieWarning": cookie_warning,
+    }
+
+
+def handle_launch(msg: dict[str, Any]) -> dict[str, Any]:
+    app_id = validate_app_id(msg.get("id"))
+    apps = load_apps()
+    app = next((a for a in apps if a.get("id") == app_id), None)
+    if not app:
+        return {"ok": False, "error": f"App '{app_id}' is not installed."}
+
+    zen_exe = find_zen_exe()
+    profile_dir = safe_child(PROFILES_DIR, app_id)
+    start_url = validate_http_url(app.get("startUrl", ""), "startUrl")
+    # Refresh standard window template on launch so existing apps stay up to date.
+    setup_zen_profile(profile_dir)
+    launch_zen_app(zen_exe, profile_dir, start_url)
+    return {"ok": True, "id": app_id}
+
+
+def handle_uninstall(msg: dict[str, Any]) -> dict[str, Any]:
+    app_id = validate_app_id(msg.get("id"))
+    apps = load_apps()
+    app = next((a for a in apps if a.get("id") == app_id), None)
+    if not app:
+        return {"ok": False, "error": f"App '{app_id}' not found."}
+
+    prof_p = safe_child(PROFILES_DIR, app_id)
+    if prof_p.exists():
+        try:
+            shutil.rmtree(prof_p)
+        except OSError as exc:
+            return {
+                "ok": False,
+                "error": f"Close the running '{app['name']}' window first before removing it ({exc}).",
+            }
+
+    remove_shortcut_if_inside(app.get("startMenuShortcut"), START_MENU_DIR)
+    remove_shortcut_if_inside(app.get("desktopShortcut"), DESKTOP_DIR)
+
+    for artifact in (safe_child(ICONS_DIR, f"{app_id}.ico"), safe_child(LAUNCHERS_DIR, f"{app_id}.exe")):
+        try:
+            artifact.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    save_apps([a for a in apps if a.get("id") != app_id])
+    return {"ok": True, "id": app_id}
+
+
+def dispatch(msg: dict[str, Any]) -> dict[str, Any]:
+    action = msg.get("action")
+    if action == "ping":
+        zen_exe = find_zen_exe()
+        return {"ok": True, "version": VERSION, "zenPath": str(zen_exe)}
+    if action == "list":
+        return {"ok": True, "apps": load_apps()}
+    if action == "install":
+        return handle_install(msg)
+    if action == "launch":
+        return handle_launch(msg)
+    if action == "uninstall":
+        return handle_uninstall(msg)
+    return {"ok": False, "error": f"Unknown action: {action}"}
+
+
+def read_native_message() -> dict[str, Any] | None:
+    raw_len = sys.stdin.buffer.read(4)
+    if not raw_len or len(raw_len) < 4:
+        return None
+    msg_len = struct.unpack("<I", raw_len)[0]
+    if msg_len == 0 or msg_len > MAX_MESSAGE_BYTES:
+        raise ValueError(f"Invalid native message length: {msg_len}")
+    raw_body = sys.stdin.buffer.read(msg_len)
+    if len(raw_body) < msg_len:
+        return None
+    return json.loads(raw_body.decode("utf-8"))
+
+
+def write_native_message(payload: dict[str, Any]) -> None:
+    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    sys.stdout.buffer.write(struct.pack("<I", len(encoded)))
+    sys.stdout.buffer.write(encoded)
+    sys.stdout.buffer.flush()
+
+
+def main() -> int:
+    if len(sys.argv) >= 3 and sys.argv[1] == "--cli":
+        try:
+            req = json.loads(sys.argv[2])
+            res = dispatch(req)
+        except Exception as exc:
+            res = {"ok": False, "error": str(exc)}
+        print(json.dumps(res, indent=2))
+        return 0 if res.get("ok") else 1
+
+    try:
+        while True:
+            msg = read_native_message()
+            if msg is None:
+                break
+            try:
+                resp = dispatch(msg)
+            except Exception as exc:
+                resp = {"ok": False, "error": str(exc)}
+            write_native_message(resp)
+    except Exception as exc:
+        try:
+            write_native_message({"ok": False, "error": str(exc)})
+        except Exception:
+            pass
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

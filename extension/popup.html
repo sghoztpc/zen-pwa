@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Zen PWA</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header class="header">
+    <div class="brand">
+      <span class="brand-title">Zen PWA</span>
+      <span id="hostStatus" class="status-pill status-checking">Checking helper...</span>
+    </div>
+  </header>
+
+  <main class="container">
+    <section id="currentSiteCard" class="card">
+      <div class="site-header">
+        <img id="siteIcon" class="site-icon" alt="" />
+        <div class="site-meta">
+          <div class="badge-row">
+            <span id="manifestBadge" class="badge">Scanning...</span>
+          </div>
+          <input id="appNameInput" class="name-input" type="text" maxlength="80" placeholder="App name" />
+          <input id="startUrlInput" class="url-input" type="url" maxlength="2048" placeholder="https://example.com/" />
+        </div>
+      </div>
+
+      <div class="options-group">
+        <label class="checkbox-row">
+          <input id="syncSessionCheck" type="checkbox" checked />
+          <span>Keep my Zen login (sync site cookies)</span>
+        </label>
+        <label class="checkbox-row">
+          <input id="desktopShortcutCheck" type="checkbox" checked />
+          <span>Also create Desktop shortcut</span>
+        </label>
+      </div>
+
+      <div class="actions">
+        <button id="installBtn" class="btn btn-primary" disabled>Install as Zen App</button>
+        <button id="popupWindowBtn" class="btn btn-secondary" title="Open in a chromeless Zen popup window using your active session">Popup Window</button>
+      </div>
+
+      <div id="messageBox" class="message hidden"></div>
+    </section>
+
+    <section class="section">
+      <h2 class="section-title">Installed Zen Apps</h2>
+      <div id="appsList" class="apps-list">
+        <div class="empty-state">No apps installed yet.</div>
+      </div>
+    </section>
+  </main>
+
+  <script src="popup.js"></script>
+</body>
+</html>
