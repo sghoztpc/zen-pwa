@@ -315,13 +315,38 @@ def sync_domain_cookies(profile_dir: Path, start_url: str) -> tuple[int, str | N
 
 
 MAX_EXTENSIONS_JSON_BYTES = 5 * 1024 * 1024
+MAX_PREFS_JS_BYTES = 10 * 1024 * 1024
+MAX_EXT_STORAGE_BYTES = 100 * 1024 * 1024
+MAX_EXT_STORAGE_FILES = 2000
+UUID_RE = re.compile(r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
+WEBEXT_UUIDS_LINE_RE = re.compile(r'^user_pref\("extensions\.webextensions\.uuids",\s*("(?:\\.|[^"\\])*")\);\s*$', re.MULTILINE)
+
+# Never copy local/sync storage of password managers, crypto wallets, or 2FA vaults across profiles.
+SENSITIVE_STORAGE_EXTENSION_IDS = {
+    "{446900e4-71c2-419f-a6a7-df9c091e268b}",  # Bitwarden
+    "{d634138d-c276-4fc8-924b-40a0ea21d284}",  # 1Password
+    "78272b6fa58f4a1abaac99321d503a20@proton.me",  # Proton Pass
+    "keepassxc-browser@keepassxc.org",  # KeePassXC-Browser
+    "support@lastpass.com",  # LastPass
+    "jetpack@dashlane.com",  # Dashlane
+    "webextension@metamask.io",  # MetaMask
+    "{a4c4eda4-fb84-4a84-b4a1-f7c1cbf2a1ad}",  # Phantom
+    "rabby@debank.com",  # Rabby Wallet
+    "authenticator@mymindstorm",  # Authenticator 2FA
+}
 
 
 def _is_link_or_junction(path: Path) -> bool:
-    if path.is_symlink():
-        return True
-    is_junc = getattr(path, "is_junction", None)
-    return bool(is_junc()) if callable(is_junc) else False
+    try:
+        if path.is_symlink():
+            return True
+        is_junc = getattr(path, "is_junction", None)
+        if callable(is_junc) and is_junc():
+            return True
+        st = os.lstat(path)
+        return bool(getattr(st, "st_file_attributes", 0) & 0x400)
+    except OSError:
+        return False
 
 
 def _validate_xpi_candidate(candidate: Path, src_ext_dir: Path) -> Path | None:
@@ -399,13 +424,312 @@ def collect_zen_extension_xpis(src_profile: Path) -> list[Path]:
     return candidates
 
 
+def _parse_webext_uuids_text(text: str) -> dict[str, str]:
+    m = WEBEXT_UUIDS_LINE_RE.search(text)
+    if not m:
+        return {}
+    try:
+        inner_json = json.loads(m.group(1))
+        mapping = json.loads(inner_json)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(mapping, dict):
+        return {}
+    return {
+        k: v
+        for k, v in mapping.items()
+        if isinstance(k, str) and isinstance(v, str) and UUID_RE.fullmatch(v)
+    }
+
+
+def read_webext_uuids(prefs_path: Path) -> dict[str, str]:
+    """Read and validate the extensions.webextensions.uuids map from a Firefox/Zen prefs.js."""
+    if not prefs_path.is_file() or _is_link_or_junction(prefs_path):
+        return {}
+    try:
+        if prefs_path.stat().st_size > MAX_PREFS_JS_BYTES:
+            return {}
+        text = prefs_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    return _parse_webext_uuids_text(text)
+
+
+def merge_webext_uuids_into_prefs(profile_dir: Path, updates: dict[str, str]) -> bool:
+    """Merge extension UUIDs into the app profile's prefs.js atomically."""
+    raw_prefs = profile_dir / "prefs.js"
+    if not updates or _is_link_or_junction(raw_prefs):
+        return False
+    try:
+        prefs_path = safe_child(profile_dir, "prefs.js")
+    except ValueError:
+        return False
+    existing_text = ""
+    if prefs_path.is_file():
+        try:
+            if prefs_path.stat().st_size > MAX_PREFS_JS_BYTES:
+                return False
+            existing_text = prefs_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+
+    merged = _parse_webext_uuids_text(existing_text)
+    merged.update(updates)
+    encoded_val = json.dumps(json.dumps(merged, separators=(",", ":")))
+    new_line = f'user_pref("extensions.webextensions.uuids", {encoded_val});'
+
+    if WEBEXT_UUIDS_LINE_RE.search(existing_text):
+        updated_text = WEBEXT_UUIDS_LINE_RE.sub(lambda _: new_line, existing_text, count=1)
+    else:
+        sep = "" if (not existing_text or existing_text.endswith("\n")) else "\n"
+        updated_text = f"{existing_text}{sep}{new_line}\n"
+
+    tmp_path: Path | None = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(dir=prefs_path.parent, prefix=".prefs-", suffix=".tmp")
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        tmp_path.write_text(updated_text, encoding="utf-8")
+        tmp_path.replace(prefs_path)
+        tmp_path = None
+        return True
+    except OSError:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return False
+
+
+def _sqlite_backup_file(src_db: Path, dst_db: Path) -> None:
+    """Safely snapshot a live (possibly WAL-mode) SQLite DB into dst_db."""
+    src_conn = sqlite3.connect(f"{src_db.as_uri()}?mode=ro", uri=True, timeout=5.0)
+    try:
+        dst_conn = sqlite3.connect(str(dst_db), timeout=5.0)
+        try:
+            src_conn.backup(dst_conn)
+            dst_conn.commit()
+        finally:
+            dst_conn.close()
+    finally:
+        src_conn.close()
+
+
+def _copy_idb_origin_dir(src_dir: Path, dst_parent: Path, folder_name: str) -> None:
+    """Copy a moz-extension+++<uuid>* storage folder atomically using SQLite backup for .sqlite files."""
+    raw_dst = dst_parent / folder_name
+    if _is_link_or_junction(raw_dst):
+        raise ValueError("Destination extension storage path is a link.")
+    dst_dir = safe_child(dst_parent, folder_name)
+
+    stage_dir = Path(tempfile.mkdtemp(dir=dst_parent, prefix=".sync-"))
+    backup_dir: Path | None = None
+    try:
+        src_root = src_dir.resolve()
+        total_files = 0
+        total_bytes = 0
+        for root, dirs, files in os.walk(src_root, followlinks=False):
+            root_path = Path(root)
+            if not root_path.resolve().is_relative_to(src_root):
+                continue
+            rel = root_path.relative_to(src_root)
+            safe_dirs: list[str] = []
+            for d in dirs:
+                dp = root_path / d
+                if not _is_link_or_junction(dp) and dp.resolve().is_relative_to(src_root):
+                    safe_dirs.append(d)
+            dirs[:] = safe_dirs
+            target_dir = stage_dir / rel
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for fname in files:
+                lower = fname.lower()
+                if lower.endswith((".sqlite-wal", ".sqlite-shm", ".sqlite-journal")):
+                    continue
+                src_file = root_path / fname
+                if _is_link_or_junction(src_file) or not src_file.resolve().is_relative_to(src_root):
+                    continue
+                fsize = src_file.stat().st_size
+                total_files += 1
+                total_bytes += fsize
+                if total_files > MAX_EXT_STORAGE_FILES or total_bytes > MAX_EXT_STORAGE_BYTES:
+                    raise ValueError("Extension storage exceeds copy safety cap.")
+                dst_file = target_dir / fname
+                if lower.endswith(".sqlite"):
+                    _sqlite_backup_file(src_file, dst_file)
+                else:
+                    shutil.copy2(src_file, dst_file)
+
+        # Atomic swap: rename existing dst_dir to a sibling backup first (fails cleanly if app has it locked).
+        if dst_dir.exists():
+            backup_dir = dst_parent / f".bak-{stage_dir.name}"
+            dst_dir.rename(backup_dir)
+        try:
+            stage_dir.rename(dst_dir)
+            stage_dir = None  # type: ignore[assignment]
+        except OSError:
+            if backup_dir is not None and backup_dir.exists() and not dst_dir.exists():
+                try:
+                    backup_dir.rename(dst_dir)
+                    backup_dir = None
+                except OSError:
+                    pass
+            raise
+        if backup_dir is not None and backup_dir.exists():
+            shutil.rmtree(backup_dir, ignore_errors=True)
+            backup_dir = None
+    finally:
+        if stage_dir is not None and stage_dir.exists():
+            shutil.rmtree(stage_dir, ignore_errors=True)
+
+
+def _unlink_sqlite_sidecars(db_path: Path) -> None:
+    for suffix in ("-wal", "-shm", "-journal"):
+        sc = Path(f"{db_path}{suffix}")
+        if sc.exists() and not _is_link_or_junction(sc):
+            try:
+                sc.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def sync_storage_sync_db(src_profile: Path, profile_dir: Path, active_ext_ids: set[str]) -> str | None:
+    """Copy browser.storage.sync entries for active extensions from main Zen into the app profile."""
+    src_db = src_profile / "storage-sync-v2.sqlite"
+    if not src_db.is_file() or _is_link_or_junction(src_db) or not active_ext_ids:
+        return None
+    raw_dst = profile_dir / "storage-sync-v2.sqlite"
+    if _is_link_or_junction(raw_dst):
+        return "Skipped storage.sync copy because destination is a link."
+
+    tmp_path: Path | None = None
+    try:
+        dst_db = safe_child(profile_dir, "storage-sync-v2.sqlite")
+        fd, tmp_name = tempfile.mkstemp(dir=profile_dir, prefix=".sync-v2-", suffix=".sqlite")
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        _sqlite_backup_file(src_db, tmp_path)
+
+        placeholders = ", ".join("?" for _ in active_ext_ids)
+        params = list(active_ext_ids)
+        conn = sqlite3.connect(str(tmp_path), timeout=5.0)
+        try:
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "storage_sync_data" in tables:
+                conn.execute(f"DELETE FROM storage_sync_data WHERE ext_id NOT IN ({placeholders})", params)
+            if "storage_sync_mirror" in tables:
+                conn.execute(
+                    f"DELETE FROM storage_sync_mirror WHERE ext_id IS NOT NULL AND ext_id NOT IN ({placeholders})",
+                    params,
+                )
+            if "storage_sync_staging" in tables:
+                conn.execute("DELETE FROM storage_sync_staging")
+            conn.commit()
+            conn.execute("VACUUM")
+        finally:
+            conn.close()
+
+        tmp_path.replace(dst_db)
+        tmp_path = None
+        _unlink_sqlite_sidecars(dst_db)
+        return None
+    except (OSError, ValueError, sqlite3.Error):
+        if tmp_path is not None:
+            _unlink_sqlite_sidecars(tmp_path)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return "Could not update extension storage.sync (close the app and retry)."
+
+
+def _sync_idb_storage_dirs(
+    src_profile_res: Path,
+    profile_dir: Path,
+    uuids: list[str],
+) -> tuple[int, str | None]:
+    src_storage_root = src_profile_res / "storage"
+    src_storage_raw = src_storage_root / "default"
+    if not src_storage_raw.is_dir() or _is_link_or_junction(src_storage_root) or _is_link_or_junction(src_storage_raw):
+        return (0, None)
+    src_storage_dir = src_storage_raw.resolve()
+    if not src_storage_dir.is_relative_to(src_profile_res):
+        return (0, None)
+
+    dst_storage_root = profile_dir / "storage"
+    dst_default_raw = dst_storage_root / "default"
+    if _is_link_or_junction(dst_storage_root) or _is_link_or_junction(dst_default_raw):
+        return (0, "Skipped extension storage because app storage path is a link.")
+    try:
+        dst_storage_dir = safe_child(safe_child(profile_dir, "storage"), "default")
+        dst_storage_dir.mkdir(parents=True, exist_ok=True)
+    except (OSError, ValueError):
+        return (0, "Could not create app extension storage directory.")
+
+    copied = 0
+    failed = 0
+    for uid in uuids:
+        for suffix in ("", "^userContextId=4294967295"):
+            folder_name = f"moz-extension+++{uid}{suffix}"
+            src_origin = src_storage_dir / folder_name
+            if not src_origin.is_dir() or _is_link_or_junction(src_origin):
+                continue
+            try:
+                if not src_origin.resolve().is_relative_to(src_storage_dir):
+                    continue
+                _copy_idb_origin_dir(src_origin, dst_storage_dir, folder_name)
+                copied += 1
+            except (OSError, ValueError, sqlite3.Error):
+                failed += 1
+    warn = f"Could not sync {failed} extension storage folder(s) (close the app and retry)." if failed else None
+    return (copied, warn)
+
+
+def sync_zen_extension_settings(
+    src_profile: Path,
+    profile_dir: Path,
+    active_ext_ids: set[str],
+) -> tuple[int, str | None]:
+    """Sync extension settings (UUID map, storage.local/IndexedDB, and storage.sync) from main Zen."""
+    if not active_ext_ids:
+        return (0, None)
+
+    src_profile_res = src_profile.resolve()
+    src_uuids = read_webext_uuids(src_profile_res / "prefs.js")
+    active_lower = {e.lower() for e in active_ext_ids}
+    blocked_lower = {e.lower() for e in SENSITIVE_STORAGE_EXTENSION_IDS} | {SELF_EXTENSION_ID.lower()}
+    matched_uuids = {
+        ext_id: uid
+        for ext_id, uid in src_uuids.items()
+        if ext_id.lower() in active_lower and ext_id.lower() not in blocked_lower
+    }
+    if not matched_uuids:
+        return (0, None)
+
+    warnings: list[str] = []
+    if not merge_webext_uuids_into_prefs(profile_dir, matched_uuids):
+        warnings.append("Could not update extension UUIDs in app prefs.js.")
+
+    copied_dirs, idb_warn = _sync_idb_storage_dirs(src_profile_res, profile_dir, list(matched_uuids.values()))
+    if idb_warn:
+        warnings.append(idb_warn)
+
+    sync_warn = sync_storage_sync_db(src_profile_res, profile_dir, set(matched_uuids.keys()))
+    if sync_warn:
+        warnings.append(sync_warn)
+
+    return (copied_dirs, "; ".join(warnings) if warnings else None)
+
+
 def sync_zen_extensions(
     profile_dir: Path,
     candidates: list[Path] | None = None,
+    src_profile: Path | None = None,
 ) -> tuple[int, str | None]:
-    """Copy active profile extensions (.xpi) from main Zen into the app profile."""
-    if candidates is None:
+    """Copy active profile extensions (.xpi) and their settings from main Zen into the app profile."""
+    if src_profile is None:
         src_profile = find_default_zen_profile()
+    if candidates is None:
         if not src_profile:
             return (0, "Default Zen profile not found; skipped extension sync.")
         candidates = collect_zen_extension_xpis(src_profile)
@@ -459,8 +783,16 @@ def sync_zen_extensions(
                 except OSError:
                     pass
 
-    warning = f"Could not copy {failed} extension(s) into app profile." if failed else None
-    return (synced, warning)
+    warnings: list[str] = []
+    if failed:
+        warnings.append(f"Could not copy {failed} extension(s) into app profile.")
+    if src_profile is not None and candidates:
+        active_ids = {p.stem for p in candidates}
+        _, settings_warn = sync_zen_extension_settings(src_profile, profile_dir, active_ids)
+        if settings_warn:
+            warnings.append(settings_warn)
+
+    return (synced, "; ".join(warnings) if warnings else None)
 
 
 def ensure_dirs() -> None:
@@ -1205,7 +1537,7 @@ def handle_sync_all() -> dict[str, Any]:
             app_id = validate_app_id(raw_id)
             profile_dir = safe_child(PROFILES_DIR, app_id)
             setup_zen_profile(profile_dir)
-            ext_count, ext_warn = sync_zen_extensions(profile_dir, candidates=candidates)
+            ext_count, ext_warn = sync_zen_extensions(profile_dir, candidates=candidates, src_profile=src_profile)
             results.append({"id": app_id, "extensionsSynced": ext_count, "warning": ext_warn})
         except (OSError, ValueError, AttributeError) as exc:
             results.append({"id": raw_id, "extensionsSynced": 0, "warning": str(exc)})
